@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wlr_screencopy_unstable_v1">
+  <copyright>
+    Copyright © 2018 Simon Ser
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED.
+  </copyright>
+
+  <interface name="zwlr_screencopy_manager_v1" version="3">
+    <description summary="manager for capturing screen contents"/>
+
+    <request name="capture_output">
+      <description summary="capture an entire output"/>
+      <arg name="id"             type="new_id" interface="zwlr_screencopy_frame_v1"/>
+      <arg name="overlay_cursor" type="int"/>
+      <arg name="output"         type="object" interface="wl_output"/>
+    </request>
+
+    <request name="capture_output_region">
+      <description summary="capture a sub-region of an output"/>
+      <arg name="id"             type="new_id" interface="zwlr_screencopy_frame_v1"/>
+      <arg name="overlay_cursor" type="int"/>
+      <arg name="output"         type="object" interface="wl_output"/>
+      <arg name="x"              type="int"/>
+      <arg name="y"              type="int"/>
+      <arg name="width"          type="int"/>
+      <arg name="height"         type="int"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager"/>
+    </request>
+  </interface>
+
+  <interface name="zwlr_screencopy_frame_v1" version="3">
+    <description summary="object representing a single captured frame"/>
+
+    <!-- Sent immediately after creation describing the buffer the client must allocate -->
+    <event name="buffer">
+      <arg name="format" type="uint"/>
+      <arg name="width"  type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="stride" type="uint"/>
+    </event>
+
+    <!-- Bitmask flags (e.g. y_invert) -->
+    <event name="flags">
+      <arg name="flags" type="uint"/>
+    </event>
+
+    <!-- Frame captured successfully; timestamp in CLOCK_MONOTONIC nanoseconds -->
+    <event name="ready">
+      <arg name="tv_sec_hi" type="uint"/>
+      <arg name="tv_sec_lo" type="uint"/>
+      <arg name="tv_nsec"   type="uint"/>
+    </event>
+
+    <!-- Capture failed (e.g. output removed) -->
+    <event name="failed"/>
+
+    <!-- Damaged region hint (v2) -->
+    <event name="damage" since="2">
+      <arg name="x"      type="uint"/>
+      <arg name="y"      type="uint"/>
+      <arg name="width"  type="uint"/>
+      <arg name="height" type="uint"/>
+    </event>
+
+    <!-- DMA-buf alternative buffer info (v3) -->
+    <event name="linux_dmabuf" since="3">
+      <arg name="format" type="uint"/>
+      <arg name="width"  type="uint"/>
+      <arg name="height" type="uint"/>
+    </event>
+
+    <!-- Signals end of buffer advertisements (v3) -->
+    <event name="buffer_done" since="3"/>
+
+    <enum name="flags">
+      <entry name="y_invert" value="1" summary="contents are y-inverted"/>
+    </enum>
+
+    <enum name="error">
+      <entry name="already_used"   value="0" summary="copy request was already made for this frame"/>
+      <entry name="invalid_buffer" value="1" summary="supplied buffer is invalid"/>
+    </enum>
+
+    <!-- Copy screen contents into buffer, then emit ready or failed -->
+    <request name="copy">
+      <arg name="buffer" type="object" interface="wl_buffer"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+
+    <!-- Like copy, but also emits damage events (v2) -->
+    <request name="copy_with_damage" since="2">
+      <arg name="buffer" type="object" interface="wl_buffer"/>
+    </request>
+  </interface>
+</protocol>
