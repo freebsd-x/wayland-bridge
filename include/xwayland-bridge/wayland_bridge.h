@@ -48,6 +48,7 @@ public:
 
     [[nodiscard]] int getEventFd() const noexcept;
     [[nodiscard]] int ipcFd() const noexcept;
+    void pollIdleNotifications(uint32_t now_ms) noexcept;
     [[nodiscard]] const std::string& getSocketName() const noexcept { return socket_name_; }
 
     void dispatch() noexcept;
@@ -109,7 +110,8 @@ public:
     // --- xdg_toplevel ---
     static void xdgToplevelSetTitle(wl_client*, wl_resource*, const char*) noexcept;
     static void xdgToplevelSetAppId(wl_client*, wl_resource*, const char*) noexcept;
-    static void xdgToplevelSetParent(wl_client*, wl_resource*, wl_resource*) noexcept;
+
+    static void xdgToplevelDestroy(wl_client* client, wl_resource* resource) noexcept;    static void xdgToplevelSetParent(wl_client*, wl_resource*, wl_resource*) noexcept;
     static void xdgToplevelResize(wl_client*, wl_resource*, wl_resource*, uint32_t, uint32_t) noexcept;
 
     // --- xdg_positioner ---
@@ -399,6 +401,9 @@ private:
     // Send a surface's pending buffer to the xserver and release it to the client.
     // Used by both surfaceCommit and the sync-child drain in parent commit.
     static void applyCommit(SurfaceState* state, float sub_x = 0.0f, float sub_y = 0.0f) noexcept;
+    // The surface has lost what made it a window, menu or part of one: off the screen.
+    static void surfaceGone(SurfaceState* state) noexcept;
+    static void sendShmFrame(SurfaceState* state, struct BufferState* buf, float sub_x, float sub_y) noexcept;
 
     UniqueWlDisplay display_{nullptr};
     wl_event_loop* event_loop_{nullptr};
@@ -491,6 +496,9 @@ private:
     std::vector<wl_resource*> keyboard_resources_;
     // Surface that currently holds keyboard focus
     wl_resource* keyboard_focus_surface_{nullptr};
+    wl_resource* pointer_surface_{nullptr};   // the surface the compositor says the pointer is over
+    void setPointerSurface(wl_resource* surface) noexcept;
+    void focusKeyboard(wl_resource* surface) noexcept;
     // Monotonic serial used for wl_keyboard events
     uint32_t keyboard_serial_{2000};
     // XKB keymap fd (written to shm; shared read-only with clients)
@@ -525,7 +533,6 @@ private:
     // Called by input dispatch on any user input
     void notifyActivity() noexcept;
     // Called by poll loop to check idle timeouts
-    void pollIdleNotifications(uint32_t now_ms) noexcept;
 
 };
 
@@ -617,6 +624,7 @@ struct BufferState {
     int32_t stride{0};
     int32_t offset{0};
     uint32_t format{0};
+    bool shm{false};  // fd is the wl_shm pool: pixels start at offset, one row every stride
     // wp_single_pixel_buffer_v1: true when this is a solid-color buffer (no fd)
     bool solid_color{false};
     uint32_t solid_argb{0}; // packed ARGB 0xAARRGGBB
@@ -625,6 +633,9 @@ struct BufferState {
 struct SurfaceState {
     uint32_t id{0};
     BufferState* pending_buffer{nullptr};
+    // A client can destroy a buffer it attached before committing it.
+    wl_listener buffer_gone{};
+    bool watching_buffer{false};
     wl_resource* attached_buffer_resource{nullptr}; // held for wl_buffer.release
     wl_resource* xdg_surface{nullptr};
     wl_resource* xdg_toplevel{nullptr};

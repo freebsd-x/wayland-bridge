@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <csignal>
 #include <cstring>
+#include <cstdlib>
 #include <time.h>
 
 using namespace fbx::xwayland;
@@ -37,7 +38,8 @@ int main() {
 
     // Spawn Xwayland connected to the bridge's Wayland socket
     fbx::xwayland::XwaylandManager xwl_mgr;
-    if (xwl_mgr.spawn(bridge->getSocketName())) {
+    // Only on request: nothing here has been tried with it, and it costs a server.
+    if (std::getenv("FBX_XWAYLAND") && xwl_mgr.spawn(bridge->getSocketName())) {
         std::cout << "[xwayland-bridge] Xwayland running on "
                   << xwl_mgr.displayName() << "\n";
         // Notify compositor of DISPLAY via XBus
@@ -59,8 +61,6 @@ int main() {
             // write() has no flags argument and so can never frame the record.
             (void)send(bridge->ipcFd(), p, sizeof(xmsg), MSG_EOR);
         }
-    } else {
-        std::cerr << "[xwayland-bridge] Warning: Xwayland not available\n";
     }
 
     // fds[0] = Wayland event loop fd (incoming client requests)
@@ -112,7 +112,15 @@ int main() {
                     mh.msg_controllen = sizeof(ctrl);
 
                     ssize_t n = recvmsg(fds[1].fd, &mh, MSG_DONTWAIT);
-                    if (n <= 0) break;
+                    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        // The compositor is gone. POLLIN stays set on a closed
+                        // socket, so carrying on would spin; our windows went
+                        // with it, so there is nothing left to do but leave.
+                        std::cerr << "[xwayland-bridge] compositor closed the connection; exiting\n";
+                        running = false;
+                        break;
+                    }
+                    if (n < 0) break;
 
                     int received_fd = -1;
                     if (auto* cmsg = CMSG_FIRSTHDR(&mh);

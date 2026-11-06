@@ -1,3 +1,7 @@
+#include "xserver/shm_frame.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "xwayland-bridge/wayland_bridge.h"
 #include "xdg-shell-protocol.h"
 #include "single-pixel-buffer-v1-protocol.h"
@@ -40,9 +44,29 @@ namespace fbx::xwayland {
 // Interface implementation tables
 // ============================================================
 
+// Regions only describe opaque and input areas, which are hints the compositor
+// doesn't use yet; a client still has to be able to make them (a NULL handler here
+// is fatal: libwayland aborts the connection of the first client to ask).
+static const struct wl_region_interface region_implementation = {
+    .destroy  = [](wl_client*, wl_resource* resource) { wl_resource_destroy(resource); },
+    .add      = [](wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+    .subtract = [](wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+};
+
+// A buffer's one request. With no handler, a client destroying a buffer (Chromium,
+// closing a menu) brought the whole bridge down, and every Wayland window with it.
+static const struct wl_buffer_interface buffer_implementation = {
+    .destroy = [](wl_client*, wl_resource* resource) { wl_resource_destroy(resource); },
+};
+
 static const struct wl_compositor_interface compositor_implementation = {
     .create_surface = WaylandBridge::createSurface,
-    .create_region  = nullptr
+    .create_region  = [](wl_client* client, wl_resource* resource, uint32_t id) {
+        wl_resource* region = wl_resource_create(client, &wl_region_interface,
+                                                 wl_resource_get_version(resource), id);
+        if (!region) { wl_client_post_no_memory(client); return; }
+        wl_resource_set_implementation(region, &region_implementation, nullptr, nullptr);
+    },
 };
 
 static const struct wl_shm_pool_interface shm_pool_implementation = {
@@ -55,17 +79,20 @@ static const struct wl_shm_interface shm_implementation = {
     .create_pool = WaylandBridge::shmCreatePool
 };
 
+// The bridge redraws what a client commits whole, so damage and these hints have
+// nothing to change yet; a NULL handler would abort the client's connection.
 static const struct wl_surface_interface surface_implementation = {
     .destroy              = WaylandBridge::surfaceDestroy,
     .attach               = WaylandBridge::surfaceAttach,
-    .damage               = nullptr,
+    .damage               = [](wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
     .frame                = WaylandBridge::surfaceFrame,
-    .set_opaque_region    = nullptr,
-    .set_input_region     = nullptr,
+    .set_opaque_region    = [](wl_client*, wl_resource*, wl_resource*) {},
+    .set_input_region     = [](wl_client*, wl_resource*, wl_resource*) {},
     .commit               = WaylandBridge::surfaceCommit,
-    .set_buffer_transform = nullptr,
-    .set_buffer_scale     = nullptr,
-    .damage_buffer        = nullptr
+    .set_buffer_transform = [](wl_client*, wl_resource*, int32_t) {},
+    .set_buffer_scale     = [](wl_client*, wl_resource*, int32_t) {},
+    .damage_buffer        = [](wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+    .offset               = [](wl_client*, wl_resource*, int32_t, int32_t) {},
 };
 
 static const struct zwp_linux_buffer_params_v1_interface dmabuf_params_implementation = {
@@ -193,20 +220,20 @@ static const struct xdg_surface_interface xdg_surface_implementation = {
 };
 
 static const struct xdg_toplevel_interface xdg_toplevel_implementation = {
-    .destroy          = [](wl_client*, wl_resource* r) { wl_resource_destroy(r); },
+    .destroy          = WaylandBridge::xdgToplevelDestroy,
     .set_parent       = WaylandBridge::xdgToplevelSetParent,
     .set_title        = WaylandBridge::xdgToplevelSetTitle,
     .set_app_id       = WaylandBridge::xdgToplevelSetAppId,
-    .show_window_menu = nullptr,
-    .move             = nullptr,
+    .show_window_menu = [](wl_client*, wl_resource*, wl_resource*, uint32_t, int32_t, int32_t) {},
+    .move             = [](wl_client*, wl_resource*, wl_resource*, uint32_t) {},
     .resize           = WaylandBridge::xdgToplevelResize,
-    .set_max_size     = nullptr,
-    .set_min_size     = nullptr,
-    .set_maximized    = nullptr,
-    .unset_maximized  = nullptr,
-    .set_fullscreen   = nullptr,
-    .unset_fullscreen = nullptr,
-    .set_minimized    = nullptr
+    .set_max_size     = [](wl_client*, wl_resource*, int32_t, int32_t) {},
+    .set_min_size     = [](wl_client*, wl_resource*, int32_t, int32_t) {},
+    .set_maximized    = [](wl_client*, wl_resource*) {},
+    .unset_maximized  = [](wl_client*, wl_resource*) {},
+    .set_fullscreen   = [](wl_client*, wl_resource*, wl_resource*) {},
+    .unset_fullscreen = [](wl_client*, wl_resource*) {},
+    .set_minimized    = [](wl_client*, wl_resource*) {}
 };
 
 static const struct wl_seat_interface seat_implementation = {
@@ -394,6 +421,7 @@ void WlDisplayDeleter::operator()(wl_display* display) const noexcept {
 }
 
 WaylandBridge::~WaylandBridge() noexcept {
+    ipc_connected_ = false;   // surfaces destroyed below have no one left to tell
     if (keymap_fd_ >= 0) ::close(keymap_fd_);
     if (dmabuf_feedback_table_fd_ >= 0) ::close(dmabuf_feedback_table_fd_);
 }
@@ -618,8 +646,9 @@ std::expected<void, BridgeError> WaylandBridge::init() noexcept {
     setOutputLayout({default_out});
     if (output_globals_.empty()) return std::unexpected(BridgeError::DISPLAY_CREATION_ERROR);
 
-    const char* socket = wl_display_add_socket_auto(display_.get());
-    if (!socket) return std::unexpected(BridgeError::SOCKET_CREATION_ERROR);
+    // A fixed name: the shell tells apps WAYLAND_DISPLAY=wayland-0.
+    const char* socket = "wayland-0";
+    if (wl_display_add_socket(display_.get(), socket) != 0) return std::unexpected(BridgeError::SOCKET_CREATION_ERROR);
     socket_name_ = socket;
 
     setenv("WAYLAND_DISPLAY", socket_name_.c_str(), 1);
@@ -632,7 +661,7 @@ std::expected<void, BridgeError> WaylandBridge::init() noexcept {
 // ============================================================
 
 std::expected<void, BridgeError> WaylandBridge::setupIpc() noexcept {
-    xserver_client_ = std::make_unique<xserver::IpcSocket>("/tmp/freebsd-x.sock");
+    xserver_client_ = std::make_unique<xserver::IpcSocket>(std::getenv("XBUS_SOCKET") ? std::getenv("XBUS_SOCKET") : "/tmp/freebsdx.sock");
     if (xserver_client_->connect()) {
         ipc_connected_ = true;
         std::cout << "[xwayland-bridge] Connected to FreeBSD-X compositor.\n";
@@ -715,7 +744,9 @@ void WaylandBridge::handleIpcMessage(const std::vector<uint8_t>& data, int fd) n
     // DRM page-flip timestamps for wp_presentation (28 bytes — distinct from InputMessage/RenderMessage)
     if (data.size() == sizeof(shared::PresentFeedback)) {
         const auto* fb = reinterpret_cast<const shared::PresentFeedback*>(data.data());
-        for (auto& [sid, feedbacks] : pending_feedbacks_) {
+        auto presented = std::move(pending_feedbacks_);    // destroying one edits the live list
+        pending_feedbacks_.clear();
+        for (auto& [sid, feedbacks] : presented) {
             for (wl_resource* res : feedbacks) {
                 if (!per_output_resources_.empty() && !per_output_resources_[0].empty())
                     wp_presentation_feedback_send_sync_output(res, per_output_resources_[0][0]);
@@ -728,12 +759,13 @@ void WaylandBridge::handleIpcMessage(const std::vector<uint8_t>& data, int fd) n
                 wl_resource_destroy(res);
             }
         }
-        pending_feedbacks_.clear();
 
         // Fire wl_surface.frame() callbacks with the flip timestamp (milliseconds).
         // tv_sec_lo is seconds, tv_nsec_ is nanoseconds — combine into ms for done().
         uint32_t ts_ms = fb->tv_sec_lo_ * 1000u + fb->tv_nsec_ / 1000000u;
-        for (wl_resource* cb : pending_frame_callbacks_) {
+        auto answered = std::move(pending_frame_callbacks_);  // each removes itself when destroyed
+        pending_frame_callbacks_.clear();
+        for (wl_resource* cb : answered) {
             wl_callback_send_done(cb, ts_ms);
             wl_resource_destroy(cb);
         }
@@ -765,7 +797,15 @@ void WaylandBridge::handleIpcMessage(const std::vector<uint8_t>& data, int fd) n
             sendConfigure(it->second,
                           static_cast<int32_t>(msg->width_),
                           static_cast<int32_t>(msg->height_));
+    } else if (msg->status_ == shared::RenderMessageStatus::SurfaceClosed) {
+        // The user closed the window: ask the app to, as Wayland does.
+        auto it = surface_resources_.find(msg->surface_id_);
+        if (it != surface_resources_.end()) {
+            auto* st = static_cast<SurfaceState*>(wl_resource_get_user_data(it->second));
+            if (st && st->xdg_toplevel) xdg_toplevel_send_close(st->xdg_toplevel);
+        }
     }
+    wl_display_flush_clients(display_.get());
 }
 
 
@@ -815,19 +855,33 @@ void WaylandBridge::createSurface(wl_client* client, wl_resource* resource,
     wl_resource_set_implementation(surface_resource, &surface_implementation, state,
         [](wl_resource* res) {
             auto* st = static_cast<SurfaceState*>(wl_resource_get_user_data(res));
+            if (st->watching_buffer) wl_list_remove(&st->buffer_gone.link);
             if (st->bridge) {
+                surfaceGone(st);    // a window or menu that's gone must leave the screen
                 st->bridge->surface_resources_.erase(st->id);
                 if (st->bridge->keyboard_focus_surface_ == res)
                     st->bridge->keyboard_focus_surface_ = nullptr;
-                // Discard any pending frame callbacks so we don't fire them after destroy
+                if (st->bridge->pointer_surface_ == res)
+                    st->bridge->pointer_surface_ = nullptr;
+                // Discard this surface's frame callbacks. Those already waiting for a
+                // flip stay valid and are answered then: the client still expects it,
+                // and each removes itself from the list if it goes first.
                 for (wl_resource* cb : st->frame_callbacks)
                     wl_resource_destroy(cb);
-                auto& pfc = st->bridge->pending_frame_callbacks_;
-                // pending_frame_callbacks_ holds bare pointers — they become dangling on
-                // client disconnect so purge them.  In practice this only happens when the
-                // entire client disconnects (at which point wl_display cleans up all
-                // resources anyway), but be defensive.
-                pfc.clear();
+                // Feedback for a surface that's gone is "discarded", by protocol.
+                auto fit = st->bridge->pending_feedbacks_.find(st->id);
+                if (fit != st->bridge->pending_feedbacks_.end()) {
+                    auto waiting = std::move(fit->second);
+                    st->bridge->pending_feedbacks_.erase(fit);
+                    for (wl_resource* fb : waiting) {
+                        wp_presentation_feedback_send_discarded(fb);
+                        wl_resource_destroy(fb);
+                    }
+                }
+                // Its roles outlive it only in a client's mistake, but must not dangle.
+                if (st->xdg_popup)
+                    if (auto* pop = static_cast<PopupState*>(wl_resource_get_user_data(st->xdg_popup)))
+                        pop->surface_state = nullptr;
             }
             delete st;
         });
@@ -835,18 +889,8 @@ void WaylandBridge::createSurface(wl_client* client, wl_resource* resource,
     self->surface_resources_[state->id] = surface_resource;
     std::cout << "[xwayland-bridge] Created surface (ID: " << state->id << ")\n";
 
-    // Notify compositor
-    if (self->ipc_connected_) {
-        shared::RenderMessage msg{
-            .surface_id_ = state->id,
-            .status_     = shared::RenderMessageStatus::SurfaceCreated,
-            .width_      = 0,
-            .height_     = 0,
-            .stride_     = 0
-        };
-        (void)self->xserver_client_->sendMessage(
-            {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
-    }
+    // The compositor hears about it when it gets a role: a cursor or a helper
+    // surface isn't a window, and registering one would take the focus.
 
     // If this client has a wp_security_context identity, relay it to xserver.
     if (self->ipc_connected_) {
@@ -908,8 +952,8 @@ void WaylandBridge::shmPoolCreateBuffer(wl_client* client, wl_resource* resource
     auto* buf_state = new BufferState{ .fd = buf_fd,
                                        .width = width, .height = height,
                                        .stride = stride, .offset = offset,
-                                       .format = format };
-    wl_resource_set_implementation(buf, nullptr, buf_state, [](wl_resource* res) {
+                                       .format = format, .shm = true };
+    wl_resource_set_implementation(buf, &buffer_implementation, buf_state, [](wl_resource* res) {
         auto* s = static_cast<BufferState*>(wl_resource_get_user_data(res));
         if (s->fd >= 0) close(s->fd);
         delete s;
@@ -1084,7 +1128,7 @@ void WaylandBridge::dmabufParamsCreate(wl_client* client, wl_resource* resource,
     auto* buf_state = new BufferState{
         .fd = dup_fd, .width = width, .height = height, .format = format
     };
-    wl_resource_set_implementation(buf, nullptr, buf_state, [](wl_resource* res) {
+    wl_resource_set_implementation(buf, &buffer_implementation, buf_state, [](wl_resource* res) {
         auto* s = static_cast<BufferState*>(wl_resource_get_user_data(res));
         if (s->fd >= 0) close(s->fd);
         delete s;
@@ -1105,7 +1149,7 @@ void WaylandBridge::dmabufParamsCreateImmed(wl_client* client, wl_resource* reso
     auto* buf_state = new BufferState{
         .fd = dup_fd, .width = width, .height = height, .format = format
     };
-    wl_resource_set_implementation(buf, nullptr, buf_state, [](wl_resource* res) {
+    wl_resource_set_implementation(buf, &buffer_implementation, buf_state, [](wl_resource* res) {
         auto* s = static_cast<BufferState*>(wl_resource_get_user_data(res));
         if (s->fd >= 0) close(s->fd);
         delete s;
@@ -1126,15 +1170,41 @@ void WaylandBridge::surfaceFrame(wl_client* client, wl_resource* resource,
     auto* state = static_cast<SurfaceState*>(wl_resource_get_user_data(resource));
     wl_resource* cb = wl_resource_create(client, &wl_callback_interface, 1, callback_id);
     if (!cb) { wl_client_post_no_memory(client); return; }
-    // No implementation needed — wl_callback only sends 'done', never receives requests.
-    wl_resource_set_implementation(cb, nullptr, nullptr, nullptr);
+    // wl_callback only sends 'done', never receives requests. Gone (its client left),
+    // it must leave the list waiting for the next flip.
+    wl_resource_set_implementation(cb, nullptr, state ? state->bridge : nullptr, [](wl_resource* r) {
+        if (auto* br = static_cast<WaylandBridge*>(wl_resource_get_user_data(r))) {
+            auto& waiting = br->pending_frame_callbacks_;
+            waiting.erase(std::remove(waiting.begin(), waiting.end(), r), waiting.end());
+        }
+    });
     if (state) state->frame_callbacks.push_back(cb);
+}
+
+// Follow the buffer a surface has pending, so it's forgotten if destroyed first.
+static void watchPendingBuffer(SurfaceState* state, wl_resource* buffer) noexcept {
+    if (state->watching_buffer) {
+        wl_list_remove(&state->buffer_gone.link);
+        state->watching_buffer = false;
+    }
+    if (!buffer) return;
+    state->buffer_gone.notify = [](wl_listener* listener, void*) {
+        SurfaceState* st = nullptr;
+        st = wl_container_of(listener, st, buffer_gone);
+        wl_list_remove(&st->buffer_gone.link);
+        st->watching_buffer = false;
+        st->pending_buffer = nullptr;
+        st->attached_buffer_resource = nullptr;
+    };
+    wl_resource_add_destroy_listener(buffer, &state->buffer_gone);
+    state->watching_buffer = true;
 }
 
 void WaylandBridge::surfaceAttach(wl_client* /*client*/, wl_resource* resource,
                                    wl_resource* buffer, int32_t /*x*/,
                                    int32_t /*y*/) noexcept {
     auto* state = static_cast<SurfaceState*>(wl_resource_get_user_data(resource));
+    watchPendingBuffer(state, buffer);
     if (buffer) {
         state->pending_buffer           = static_cast<BufferState*>(
                                               wl_resource_get_user_data(buffer));
@@ -1143,6 +1213,77 @@ void WaylandBridge::surfaceAttach(wl_client* /*client*/, wl_resource* resource,
         state->pending_buffer           = nullptr;
         state->attached_buffer_resource = nullptr;
     }
+}
+
+// The surface has lost the role that made it a window, menu or part of one, though
+// the client can keep the surface itself and give it a new role later.
+void WaylandBridge::surfaceGone(SurfaceState* state) noexcept {
+    if (!state || !state->bridge || !state->bridge->ipc_connected_) return;
+    shared::RenderMessage closed{};
+    closed.surface_id_ = state->id;
+    closed.status_ = shared::RenderMessageStatus::SurfaceClosed;
+    (void)state->bridge->xserver_client_->sendMessage(
+        {reinterpret_cast<const uint8_t*>(&closed), sizeof(closed)});
+}
+
+// The compositor has no use for a client's pool: the client may shrink or rewrite
+// it at any time. So each frame goes as a private copy in a memory file sealed
+// against shrinking, in the byte order the compositor uploads (RGBA). The client
+// can have its buffer back as soon as this returns.
+void WaylandBridge::sendShmFrame(SurfaceState* state, BufferState* buf, float sub_x, float sub_y) noexcept {
+    const int64_t w = buf->width, h = buf->height, stride = buf->stride, offset = buf->offset;
+    if (w <= 0 || h <= 0 || stride < w * 4 || offset < 0 ||
+        (buf->format != WL_SHM_FORMAT_ARGB8888 && buf->format != WL_SHM_FORMAT_XRGB8888))
+        return;
+    const int64_t need = offset + stride * (h - 1) + w * 4;
+    struct stat st{};
+    if (fstat(buf->fd, &st) != 0 || st.st_size < need) return;
+
+    const size_t out_bytes = xserver::shmframe::frameBytes(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    if (out_bytes == 0) return;
+    int out = memfd_create("wayland-frame", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (out < 0) return;
+    void* src = MAP_FAILED;
+    void* dst = MAP_FAILED;
+    if (ftruncate(out, static_cast<off_t>(out_bytes)) == 0) {
+        src = mmap(nullptr, static_cast<size_t>(need), PROT_READ, MAP_SHARED, buf->fd, 0);
+        dst = mmap(nullptr, out_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+    }
+    if (src != MAP_FAILED && dst != MAP_FAILED) {
+        const bool opaque = buf->format == WL_SHM_FORMAT_XRGB8888;
+        auto* to = static_cast<uint8_t*>(dst);
+        for (int64_t y = 0; y < h; ++y) {
+            const uint8_t* from = static_cast<const uint8_t*>(src) + offset + y * stride;
+            for (int64_t x = 0; x < w; ++x, from += 4, to += 4) {     // memory order B, G, R, A
+                to[0] = from[2];
+                to[1] = from[1];
+                to[2] = from[0];
+                to[3] = opaque ? 0xFF : from[3];
+            }
+        }
+        if (fcntl(out, F_ADD_SEALS, F_SEAL_SHRINK) == 0) {
+            shared::RenderMessage msg{
+                .surface_id_    = state->id,
+                .status_        = shared::RenderMessageStatus::ShmFrame,
+                .width_         = static_cast<uint32_t>(w),
+                .height_        = static_cast<uint32_t>(h),
+                .stride_        = 0,
+                .damage_x_      = sub_x,
+                .damage_y_      = sub_y,
+                .damage_width_  = static_cast<float>(w),
+                .damage_height_ = static_cast<float>(h),
+                .geom_x_        = state->geom_x,
+                .geom_y_        = state->geom_y,
+                .geom_w_        = state->geom_w,
+                .geom_h_        = state->geom_h,
+            };
+            (void)state->bridge->xserver_client_->sendMessage(
+                {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)}, out);
+        }
+    }
+    if (src != MAP_FAILED) munmap(src, static_cast<size_t>(need));
+    if (dst != MAP_FAILED) munmap(dst, out_bytes);
+    close(out);
 }
 
 // Core commit logic: send pending buffer to xserver, release back to client.
@@ -1175,6 +1316,8 @@ void WaylandBridge::applyCommit(SurfaceState* state, float sub_x, float sub_y) n
             };
             std::span<const uint8_t> payload(reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
             (void)br->xserver_client_->sendMessage(payload);
+        } else if (buf->shm) {
+            sendShmFrame(state, buf, sub_x, sub_y);
         } else {
             shared::RenderMessage msg{
                 .surface_id_    = state->id,
@@ -1203,8 +1346,8 @@ void WaylandBridge::applyCommit(SurfaceState* state, float sub_x, float sub_y) n
         wl_buffer_send_release(state->attached_buffer_resource);
 
     // Move frame callbacks into the bridge-level pending list so they fire with the
-    // real DRM flip timestamp (PresentFeedback IPC, 28 bytes).  In headless/virtual
-    // mode PresentFeedback never arrives, so fire immediately with a monotonic clock.
+    // presentation time the compositor reports (PresentFeedback IPC, 28 bytes). With
+    // no compositor connection nothing would report it, so fire now.
     if (!state->frame_callbacks.empty()) {
         if (br->ipc_connected_) {
             auto& dst = br->pending_frame_callbacks_;
@@ -1224,6 +1367,7 @@ void WaylandBridge::applyCommit(SurfaceState* state, float sub_x, float sub_y) n
 
     // wp_presentation_feedback resolved by DRM flip IPC (handleIpcMessage, 28 bytes).
 
+    watchPendingBuffer(state, nullptr);
     state->pending_buffer           = nullptr;
     state->attached_buffer_resource = nullptr;
 }
@@ -1321,6 +1465,12 @@ void WaylandBridge::surfaceCommit(wl_client* /*client*/, wl_resource* resource) 
         return;
     }
 
+    // A popup goes where its positioner put it, relative to its parent.
+    if (state->xdg_popup && state->pending_buffer) {
+        auto* pop = static_cast<PopupState*>(wl_resource_get_user_data(state->xdg_popup));
+        applyCommit(state, pop ? static_cast<float>(pop->x) : 0.0f, pop ? static_cast<float>(pop->y) : 0.0f);
+    }
+
     // Normal surface (or desync-applied above): send to xserver.
     if (state->pending_buffer)
         applyCommit(state);
@@ -1372,6 +1522,20 @@ void WaylandBridge::xdgSurfaceGetToplevel(wl_client* client, wl_resource* resour
     wl_resource_set_implementation(toplevel, &xdg_toplevel_implementation, state, nullptr);
     state->xdg_toplevel = toplevel;
     std::cout << "[xwayland-bridge] xdg_toplevel for surface " << state->id << "\n";
+
+    // Now it's a window. The compositor answers with SurfaceReady and its size,
+    // which handleIpcMessage passes on as the real configure.
+    if (state->bridge && state->bridge->ipc_connected_) {
+        shared::RenderMessage msg{
+            .surface_id_ = state->id,
+            .status_     = shared::RenderMessageStatus::SurfaceCreated,
+            .width_      = 0,
+            .height_     = 0,
+            .stride_     = 0
+        };
+        (void)state->bridge->xserver_client_->sendMessage(
+            {reinterpret_cast<const uint8_t*>(&msg), sizeof(msg)});
+    }
 
     // Unblock the client immediately with (0, 0) — "you pick the size".
     // A second configure with real dimensions will follow when SurfaceReady
@@ -1722,8 +1886,15 @@ void WaylandBridge::xdgPopupReposition(wl_client* /*client*/, wl_resource* resou
         pop->surface_state->xdg_surface, ++pop->bridge->configure_serial_);
 }
 
+void WaylandBridge::xdgToplevelDestroy(wl_client* /*client*/, wl_resource* resource) noexcept {
+    surfaceGone(static_cast<SurfaceState*>(wl_resource_get_user_data(resource)));
+    wl_resource_destroy(resource);
+}
+
 void WaylandBridge::xdgPopupDestroy(wl_client* /*client*/,
                                      wl_resource* resource) noexcept {
+    if (auto* pop = static_cast<PopupState*>(wl_resource_get_user_data(resource)))
+        surfaceGone(pop->surface_state);
     wl_resource_destroy(resource); // triggers destructor → clears xdg_popup from SurfaceState
 }
 
@@ -1760,15 +1931,50 @@ void WaylandBridge::seatGetPointer(wl_client* client, wl_resource* seat_res,
         });
     self->pointer_resources_.push_back(ptr);
 
-    // Send wl_pointer.enter for this client's surface (if one exists already)
-    for (auto& [sid, sres] : self->surface_resources_) {
-        if (wl_resource_get_client(sres) == client) {
-            wl_pointer_send_enter(ptr, ++self->pointer_serial_, sres,
-                wl_fixed_from_double(self->cursor_x_),
-                wl_fixed_from_double(self->cursor_y_));
-            break;
+    // Already over one of this client's surfaces?
+    if (self->pointer_surface_ && wl_resource_get_client(self->pointer_surface_) == client)
+        wl_pointer_send_enter(ptr, ++self->pointer_serial_, self->pointer_surface_,
+            wl_fixed_from_double(self->cursor_x_),
+            wl_fixed_from_double(self->cursor_y_));
+}
+
+// Tell the clients concerned the pointer has moved on from one surface to another.
+void WaylandBridge::setPointerSurface(wl_resource* surface) noexcept {
+    if (surface == pointer_surface_) return;
+    auto each = [this](wl_resource* of, auto send) {
+        for (wl_resource* ptr : pointer_resources_) {
+            if (wl_resource_get_client(ptr) != wl_resource_get_client(of)) continue;
+            send(ptr);
+            if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
+                wl_pointer_send_frame(ptr);
         }
+    };
+    if (wl_resource* old = pointer_surface_)
+        each(old, [&](wl_resource* ptr) { wl_pointer_send_leave(ptr, ++pointer_serial_, old); });
+    pointer_surface_ = surface;
+    if (surface)
+        each(surface, [&](wl_resource* ptr) {
+            wl_pointer_send_enter(ptr, ++pointer_serial_, surface,
+                wl_fixed_from_double(cursor_x_), wl_fixed_from_double(cursor_y_));
+        });
+}
+
+void WaylandBridge::focusKeyboard(wl_resource* surface) noexcept {
+    if (surface == keyboard_focus_surface_) return;
+    struct wl_array keys;
+    wl_array_init(&keys);
+    if (wl_resource* old = keyboard_focus_surface_) {
+        sendTextInputLeave(old);
+        for (wl_resource* kbd : keyboard_resources_)
+            if (wl_resource_get_client(kbd) == wl_resource_get_client(old))
+                wl_keyboard_send_leave(kbd, ++keyboard_serial_, old);
     }
+    keyboard_focus_surface_ = surface;
+    for (wl_resource* kbd : keyboard_resources_)
+        if (wl_resource_get_client(kbd) == wl_resource_get_client(surface))
+            wl_keyboard_send_enter(kbd, ++keyboard_serial_, surface, &keys);
+    wl_array_release(&keys);
+    sendTextInputEnter(surface);
 }
 
 void WaylandBridge::seatGetKeyboard(wl_client* client, wl_resource* seat_res,
@@ -1978,11 +2184,30 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
         static_cast<uint64_t>(ts.tv_sec) * 1000u +
         static_cast<uint64_t>(ts.tv_nsec) / 1000000u);
 
-    if (msg.type_ == InputEventType::MouseMove) {
-        float dx = static_cast<float>(msg.value_a_);
-        float dy = static_cast<float>(msg.value_b_);
+    // Pointer events go to the app whose surface the pointer is over, nobody else.
+    auto pointerOwner = [this](wl_resource* ptr) {
+        return pointer_surface_ && wl_resource_get_client(ptr) == wl_resource_get_client(pointer_surface_);
+    };
 
-        // Always send relative motion to registered relative-pointer resources.
+    if (msg.type_ == InputEventType::PointerSurface) {
+        auto it = surface_resources_.find(static_cast<uint32_t>(msg.value_a_));
+        setPointerSurface(it == surface_resources_.end() ? nullptr : it->second);
+    } else if (msg.type_ == InputEventType::MouseMove) {
+        // The compositor sends the position within what it shows of the surface, its
+        // window geometry. A client's buffer can extend beyond that (Chromium draws its
+        // shadow there), and Wayland positions count from the buffer's corner.
+        float x = static_cast<float>(msg.value_a_);
+        float y = static_cast<float>(msg.value_b_);
+        if (pointer_surface_) {
+            if (auto* st = static_cast<SurfaceState*>(wl_resource_get_user_data(pointer_surface_))) {
+                x += static_cast<float>(st->geom_x);
+                y += static_cast<float>(st->geom_y);
+            }
+        }
+        const float dx = x - cursor_x_;
+        const float dy = y - cursor_y_;
+
+        // Relative motion goes to registered relative-pointer resources.
         if (!relative_pointer_resources_.empty()) {
             uint64_t us = static_cast<uint64_t>(ts.tv_sec) * 1000000u +
                           static_cast<uint64_t>(ts.tv_nsec) / 1000u;
@@ -1995,13 +2220,14 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
                     rp, utime_hi, utime_lo, fx, fy, fx, fy);
         }
 
-        // Send absolute wl_pointer.motion only when the pointer is not locked.
-        if (!pointer_locked_ && !pointer_resources_.empty()) {
-            cursor_x_ = std::max(0.0f, std::min(cursor_x_ + dx, (float)screen_width_));
-            cursor_y_ = std::max(0.0f, std::min(cursor_y_ + dy, (float)screen_height_));
+        cursor_x_ = x;
+        cursor_y_ = y;
+        // Absolute wl_pointer.motion only when the pointer is not locked.
+        if (!pointer_locked_) {
             wl_fixed_t ax = wl_fixed_from_double(cursor_x_);
             wl_fixed_t ay = wl_fixed_from_double(cursor_y_);
             for (wl_resource* ptr : pointer_resources_) {
+                if (!pointerOwner(ptr)) continue;
                 wl_pointer_send_motion(ptr, time_ms, ax, ay);
                 if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
                     wl_pointer_send_frame(ptr);
@@ -2012,9 +2238,17 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
         uint32_t button = static_cast<uint32_t>(msg.value_a_); // raw Linux BTN_* code
         uint32_t state  = static_cast<uint32_t>(msg.value_b_); // 1=pressed, 0=released
 
-        // On button press, dismiss grab-owning popups (innermost first).
-        // The grab stack holds popups outermost-first; dismiss from the back.
-        if (state == 1 && !active_popup_grabs_.empty()) {
+        // A press outside the open popups dismisses them (innermost first): the grab
+        // stack holds them outermost-first, so from the back. A press inside one is for
+        // that popup. Dismissing it first would lose the click on the menu item.
+        bool on_popup = false;
+        for (wl_resource* grab : active_popup_grabs_) {
+            auto* pop = static_cast<PopupState*>(wl_resource_get_user_data(grab));
+            if (pop && pop->surface_state && pointer_surface_ &&
+                pop->surface_state == wl_resource_get_user_data(pointer_surface_))
+                on_popup = true;
+        }
+        if (state == 1 && !on_popup && !active_popup_grabs_.empty()) {
             wl_resource* top_popup = active_popup_grabs_.back();
             auto* pop = static_cast<PopupState*>(wl_resource_get_user_data(top_popup));
             if (pop) {
@@ -2024,7 +2258,14 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
             }
         }
 
+        // Clicking a window focuses it, as the compositor has just done.
+        if (state == 1 && pointer_surface_) {
+            auto* st = static_cast<SurfaceState*>(wl_resource_get_user_data(pointer_surface_));
+            if (st && st->xdg_toplevel) focusKeyboard(pointer_surface_);
+        }
+
         for (wl_resource* ptr : pointer_resources_) {
+            if (!pointerOwner(ptr)) continue;
             wl_pointer_send_button(ptr, ++pointer_serial_, time_ms, button, state);
             if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
                 wl_pointer_send_frame(ptr);
@@ -2033,6 +2274,7 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
         int32_t lines = msg.value_b_; // positive = scroll down
         if (lines != 0) {
             for (wl_resource* ptr : pointer_resources_) {
+                if (!pointerOwner(ptr)) continue;
                 wl_pointer_send_axis(ptr, time_ms,
                     WL_POINTER_AXIS_VERTICAL_SCROLL,
                     wl_fixed_from_int(lines * 10));
@@ -2051,58 +2293,20 @@ void WaylandBridge::handleInputMessage(const shared::InputMessage& msg) noexcept
         if (msg.modifiers_ & 4) mods_depressed |= (1u << xkb_mod_alt_);
         if (msg.modifiers_ & 8) mods_depressed |= (1u << xkb_mod_logo_);
 
+        // Keys go to the focused app only: anyone else hearing them is a keylogger.
         for (wl_resource* kbd : keyboard_resources_) {
+            if (!keyboard_focus_surface_ ||
+                wl_resource_get_client(kbd) != wl_resource_get_client(keyboard_focus_surface_)) continue;
+            // Modifiers first: they're what the key that follows is read with.
+            wl_keyboard_send_modifiers(kbd, ++keyboard_serial_,
+                mods_depressed, 0, 0, 0);
             wl_keyboard_send_key(kbd, ++keyboard_serial_, time_ms, keycode,
                 key_state ? WL_KEYBOARD_KEY_STATE_PRESSED
                           : WL_KEYBOARD_KEY_STATE_RELEASED);
-            wl_keyboard_send_modifiers(kbd, ++keyboard_serial_,
-                mods_depressed, 0, 0, 0);
         }
         notifyActivity();
-
-        // Forward text via zwp_text_input_v3 for enabled resources on key-press only.
-        // No modifier keys — clients expect text input to skip control sequences.
-        if (key_state == 1 && msg.modifiers_ == 0 && !text_input_resources_.empty()) {
-            wl_client* focus_client = keyboard_focus_surface_
-                ? wl_resource_get_client(keyboard_focus_surface_) : nullptr;
-
-            for (wl_resource* ti : text_input_resources_) {
-                auto* tis = static_cast<TextInputState*>(wl_resource_get_user_data(ti));
-                if (!tis || !tis->enabled) continue;
-                if (wl_resource_get_client(ti) != focus_client) continue;
-
-                if (msg.char_value_ > 0) {
-                    // Printable character: encode codepoint as UTF-8, deliver as commit_string
-                    char utf8[5] = {};
-                    int32_t cp = msg.char_value_;
-                    if (cp <= 0x7F) {
-                        utf8[0] = static_cast<char>(cp);
-                    } else if (cp <= 0x7FF) {
-                        utf8[0] = static_cast<char>(0xC0 | (cp >> 6));
-                        utf8[1] = static_cast<char>(0x80 | (cp & 0x3F));
-                    } else if (cp <= 0xFFFF) {
-                        utf8[0] = static_cast<char>(0xE0 | (cp >> 12));
-                        utf8[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                        utf8[2] = static_cast<char>(0x80 | (cp & 0x3F));
-                    } else {
-                        utf8[0] = static_cast<char>(0xF0 | (cp >> 18));
-                        utf8[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-                        utf8[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                        utf8[3] = static_cast<char>(0x80 | (cp & 0x3F));
-                    }
-                    zwp_text_input_v3_send_preedit_string(ti, nullptr, 0, 0);
-                    zwp_text_input_v3_send_commit_string(ti, utf8);
-                    zwp_text_input_v3_send_delete_surrounding_text(ti, 0, 0);
-                    zwp_text_input_v3_send_done(ti, tis->serial);
-                } else if (keycode == 14) {
-                    // KEY_BACKSPACE (Linux evdev code 14): delete one byte before cursor
-                    zwp_text_input_v3_send_preedit_string(ti, nullptr, 0, 0);
-                    zwp_text_input_v3_send_commit_string(ti, nullptr);
-                    zwp_text_input_v3_send_delete_surrounding_text(ti, 1, 0);
-                    zwp_text_input_v3_send_done(ti, tis->serial);
-                }
-            }
-        }
+        // Plain typing is these key events: clients turn them into text with the keymap.
+        // Sending it through zwp_text_input_v3 as well typed every character twice.
     }
 
     wl_display_flush_clients(display_.get());
@@ -2897,7 +3101,10 @@ void WaylandBridge::subcompositorGetSubsurface(wl_client* client, wl_resource* /
             if (s->surface_resource) {
                 auto* cs = static_cast<SurfaceState*>(
                     wl_resource_get_user_data(s->surface_resource));
-                if (cs) cs->subsurface_resource = nullptr;
+                if (cs) {
+                    cs->subsurface_resource = nullptr;
+                    surfaceGone(cs);      // Chromium keeps the surface for its next dropdown
+                }
             }
             delete s;
         });
@@ -3134,7 +3341,10 @@ void WaylandBridge::idleInhibitManagerCreateInhibitor(wl_client* client,
 
     wl_resource* inhibitor = wl_resource_create(
         client, &zwp_idle_inhibitor_v1_interface, 1, id);
-    wl_resource_set_implementation(inhibitor, nullptr, self,
+    static const struct zwp_idle_inhibitor_v1_interface idle_inhibitor_implementation = {
+        .destroy = [](wl_client*, wl_resource* resource) { wl_resource_destroy(resource); },
+    };
+    wl_resource_set_implementation(inhibitor, &idle_inhibitor_implementation, self,
         [](wl_resource* res) {
             // Inhibitor destroyed: decrement count, re-enable idle if now zero
             auto* br = static_cast<WaylandBridge*>(wl_resource_get_user_data(res));
@@ -3224,7 +3434,7 @@ void WaylandBridge::wlDrmCreatePrimeBuffer(wl_client* client, wl_resource* /*drm
         .format = format
     };
     wl_resource* buf_res = wl_resource_create(client, &wl_buffer_interface, 1, id);
-    wl_resource_set_implementation(buf_res, nullptr, buf,
+    wl_resource_set_implementation(buf_res, &buffer_implementation, buf,
         [](wl_resource* res) {
             auto* s = static_cast<BufferState*>(wl_resource_get_user_data(res));
             if (s && s->fd >= 0) close(s->fd);
@@ -3269,7 +3479,7 @@ void WaylandBridge::spbmCreateU32RgbaBuffer(wl_client* client, wl_resource* /*mg
     buf->solid_argb  = argb;
 
     wl_resource* buffer_res = wl_resource_create(client, &wl_buffer_interface, 1, id);
-    wl_resource_set_implementation(buffer_res, nullptr, buf,
+    wl_resource_set_implementation(buffer_res, &buffer_implementation, buf,
         [](wl_resource* res) {
             delete static_cast<BufferState*>(wl_resource_get_user_data(res));
         });
